@@ -1,0 +1,227 @@
+#!/bin/bash
+set -e
+
+getpod_etcd() {
+  POD=$(kubectl get pod -n kube-system -l component=etcd -oname | head -n1)
+  if [[ -z $POD ]]; then
+    return 1
+  fi
+  echo "$POD"
+}
+
+etcdcmd() {
+  kubectl exec -i $(getpod_etcd) -n kube-system -- sh -c \
+    "ETCDCTL_API=3 etcdctl \
+--endpoints \"https://localhost:2379\"  \
+--cacert /etc/kubernetes/pki/etcd/ca.crt \
+--key /etc/kubernetes/pki/etcd/server.key \
+--cert /etc/kubernetes/pki/etcd/server.crt \
+$*"
+}
+
+#-------------- EXPORT
+
+dump() {
+  etcdcmd "get \"/registry/\" --prefix=true -w json"
+}
+
+b64Decode() {
+  # jq has issues with decoding non-utf8 values (i.e. binary data), so we leave those encoded
+  # https://github.com/jqlang/jq/issues/1931
+  jq '. |= (.kvs[] |= (.key |= @base64d))'
+}
+
+objKeys() {
+  jq '.kvs[] | .key' -r | grep '^/'
+}
+
+db() {
+  dump | b64Decode
+}
+
+dumpKv() {
+  dump | jq '.kvs[] | {k: (.key | @base64d), v: .value} | "\(.k)\n\(.v)"' -r
+}
+
+dumpToFilesystem() {
+  FILTER="${1:-*}"
+
+  mkdir -p out
+  cd out
+
+  dumpKv | while read k; do
+    read v
+
+    if [[ "${k}" == $FILTER ]]; then
+
+      of=.$k.yaml
+      echo Writing $of
+      ERR=
+      BODY=
+      BODY=$(printf "%s" "$v" | base64 -d | auger decode) || ERR=1
+      if [[ ! -z "$ERR" ]]; then
+        echo "Error writing $of: $BODY" >&2
+      elif [[ -z "$BODY" ]]; then
+        echo "Error writing $of: unknown error" >&2
+      else
+        mkdir -p ./$(dirname $k)
+        echo "$BODY" >$of
+      fi
+
+    fi
+  done
+
+}
+
+#---------------- IMPORT
+
+apiserver_act() {
+  kubectl "$@" -n kube-system pod -l component=kube-apiserver
+}
+
+trimtoregpath() {
+  rest="$1"
+
+  while [[ ! -z "$rest" ]]; do
+    front=${rest%%\/*}
+    if [[ "$front" == "registry" ]]; then
+      echo $rest
+      return 0
+    fi
+    rest=${rest#*\/}
+  done
+}
+
+trimext() {
+  echo ${1%.*}
+}
+
+etcdput() {
+  etcdcmd "put \"$1\""
+}
+
+etcddel() {
+  etcdcmd "del \"$1\""
+}
+
+function confirm() {
+  read -p "$1 (y/N): " choice
+  case "$choice" in
+  [nN]* | "") return 1 ;;
+  [yY]*) return 0 ;;
+  *) confirm "$1" ;;
+  esac
+}
+
+writeOne() {
+  full=$(realpath "$1")
+
+  regpath=/$(trimext $(trimtoregpath "$full"))
+
+  if [ -s "$full" ]; then
+
+    if confirm "Will write $full to $regpath, ok?"; then
+      set -e
+      cat "$full" | (
+        set -x
+        auger encode | etcdput "$regpath"
+      )
+      #apiserver_act delete
+    else
+      echo "skipped write"
+    fi
+
+  else
+    if confirm "Will delete key $regpath, ok?"; then
+      set -e
+      cat $full | (
+        set -x
+        etcddel "$regpath"
+      )
+    else
+      echo "skipped delete"
+    fi
+  fi
+}
+
+#----------------- Requirements
+
+has() {
+  command -v "$1" &>/dev/null
+}
+
+prereq() {
+  bad=
+  if ! has auger; then
+    echo "ERROR: Missing auger, install with \`go install github.com/etcd-io/auger@latest\`"
+    bad=1
+  fi
+  if ! has jq; then
+    echo "ERROR: Missing jq, install from https://jqlang.org"
+    bad=1
+  fi
+  if ! has kubectl; then
+    echo "ERROR: Missing kubectl, needed to execute within the etcd pod"
+    bad=1
+  fi
+  if [ ! -z "$bad" ]; then
+    return 1
+  fi
+}
+
+#----------------- Subcommands
+
+main() {
+  cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+  dump)
+    prereq && dumpToFilesystem "$@"
+    ;;
+  putyaml)
+    prereq && writeOne "$@"
+    ;;
+  *)
+    cat <<"EOF"
+Usage: krawedit (dump [ FILTER ] | putyaml FILENAME)
+
+With no subcommand, display this help text.
+
+dump: Dump the contents of a kubernetes etcd store to disk.
+
+  A new directory named "out" is created in the current directory
+  and the contents of the etcd store are exported as kubernetes yaml files.
+
+  This export assumes etcd keys are utf-8 (which they are by default)
+  and that values are binary encoded protobufs. The keys
+  are expanded to a directory and file structure (suffixed with .yaml)
+  and the contents of each file is kubernetes yaml (as decoded via auger).
+
+  Note that this may not be a complete dump: auger cannot decode *all*
+  etcd values (e.g. if some api versions of objects are non-existant),
+  including those that are not kubernetes values.
+
+  FILTER may be a shell glob pattern to limit exported keys. If not
+  specified, defaults to '*' - all keys.
+
+putyaml: Write a kubernetes object to etcd directly.
+
+  Given a filename / path to a file extracted by dump, putyaml calculates
+  the correct key from the file structure (by searching upwards for the
+  "registry" directory). This means that only etcd keys starting with the
+  "registry" prefix can be written.
+
+  If the file is zero bytes, the key is deleted instead.
+
+  If the file is greater than zero bytes, "auger encode" is used to translate
+  to protobuf format to store the kubernetes object.
+
+EOF
+    prereq
+
+    return 1
+    ;;
+  esac
+}
+
+main "${@}"
